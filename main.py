@@ -22,8 +22,22 @@ path = 'https://www.efortuna.pl/zaklady-bukmacherskie/pika-nozna/polska-3/ekstra
 #path = 'https://www.efortuna.pl/zaklady-bukmacherskie/pilka-nozna/polska-1-liga'
 s = Secrets()
 
-TIME_SLEEP = 8
-PARAMETER = 'Ekstraklasa Polska'
+TIME_SLEEP = 4
+LEAGUE_PARAMETER = 5 # LEAGUE_ID
+
+league_id = {1 : 'Ekstraklasa Polska',
+             2: 'Polska 1.liga',
+             3: 'Polska 2.',
+             4: '1.Belgia',
+             5: 'Polska 3.liga grupa II',
+             6: 'Polska 3.liga grupa I',
+             7: 'Polska 3.liga grupa III',
+             8: 'Polska 3.liga grupa IV',
+             9: '1.Anglia',
+             10: '1.Niemcy'
+            }
+
+league_name = league_id[LEAGUE_PARAMETER]
 
 def event_id_to_bigint(event_id_str):
     """Zamienia np. 'ufo:mtch:1kp-01s' na liczbę całkowitą na podstawie ASCII znaków."""
@@ -56,15 +70,95 @@ def check_if_new_teams_are_in_data(teams, parameter='home'):
 
     return new_teams
 
+def parse_event_date(event_date_raw: str,
+                     now: datetime | None = None,
+                     default_time: str = "00:00") -> str | None:
+
+    if not event_date_raw:
+        return None
+
+    now = now or datetime.now()
+    s = event_date_raw.strip().lower()
+    s = s.replace('\xa0', ' ')      # NBSP → spacja
+    s = s.replace('dziś', 'dzisiaj')  # unifikacja
+    s = s.replace('godz.', '')      # usuń "godz." jeśli jest
+    s = s.replace('godz', '')
+    # usuń "o " (np. "dzisiaj o 17:00") ale nie usuwaj wszystkich 'o' w środku przypadkowych słów:
+    s = re.sub(r'\bo\s+', '', s)
+
+    def fmt(dt: datetime) -> str:
+        return dt.strftime("%Y%m%d%H%M")
+
+    # --- przypadki specjalne: "dzisiaj" / "jutro"
+    if re.search(r'\bdzisiaj\b', s):
+        tm = re.search(r'(\d{1,2})[:.](\d{2})', s)
+        if tm:
+            h, m = map(int, tm.groups())
+        else:
+            h, m = map(int, default_time.split(':'))
+        dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        return fmt(dt)
+
+    if re.search(r'\bjutro\b', s):
+        tm = re.search(r'(\d{1,2})[:.](\d{2})', s)
+        if tm:
+            h, m = map(int, tm.groups())
+        else:
+            h, m = map(int, default_time.split(':'))
+        dt = (now + timedelta(days=1)).replace(hour=h, minute=m, second=0, microsecond=0)
+        return fmt(dt)
+
+    # --- szukamy: dd.mm(.yyyy) + czas HH:MM
+    m = re.search(r'(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?.*?(\d{1,2})[:.](\d{2})', s)
+    if m:
+        day, month, year, hh, mm = m.groups()
+        year = int(year) if year else now.year
+        try:
+            dt = datetime(year, int(month), int(day), int(hh), int(mm))
+            return fmt(dt)
+        except ValueError:
+            return None
+
+    # --- dd.mm(.yyyy) bez czasu -> użyj default_time
+    m = re.search(r'(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?', s)
+    if m:
+        day, month, year = m.groups()
+        year = int(year) if year else now.year
+        h, mm = map(int, default_time.split(':'))
+        try:
+            dt = datetime(year, int(month), int(day), h, mm)
+            return fmt(dt)
+        except ValueError:
+            return None
+
+    # --- fallback: próbujemy kilka zwykłych formatów strptime (po usunięciu ewentualnych nazw dni na początku)
+    cleaned = re.sub(r'^[^\d]*', '', s)  # usuń prefix (np. "pon., ")
+    for fmt_try in ("%d.%m.%Y, %H:%M", "%d.%m.%Y %H:%M", "%d.%m.%Y",
+                    "%d.%m, %H:%M", "%d.%m %H:%M", "%d.%m"):
+        try:
+            dt = datetime.strptime(cleaned, fmt_try)
+            if "%Y" not in fmt_try:
+                dt = dt.replace(year=now.year)
+            if "%H" not in fmt_try:
+                h, mm = map(int, default_time.split(':'))
+                dt = dt.replace(hour=h, minute=mm)
+            return fmt(dt)
+        except Exception:
+            continue
+
+    # nic nie pasuje
+    return None
 
 def check_if_new_dates_in_data(calendar):
     # Upewnij się, że kluczowe kolumny mają ten sam typ danych
     df_from_scrap["event-datetime"] = df_from_scrap["event-datetime"].astype(str)
     calendar["DATE"] = calendar["DATE"].astype(str)
 
+    df_unique = df_from_scrap.drop_duplicates(subset=['event-datetime'], keep='first')
+
     # Łączenie danych
     test_join = pd.merge(
-        left=df_from_scrap,
+        left=df_unique,
         right=calendar,
         how='outer',
         left_on=['event-datetime'],
@@ -87,6 +181,7 @@ def check_if_new_dates_in_data(calendar):
     new_calendar["ID"] = max_index_value + new_calendar.index + 1
     new_calendar['DATE'] = new_calendar['DATE'].fillna(new_calendar['event-datetime'])
     del new_calendar['event-datetime']
+    #usuwam duplikaty daty
 
     # Łączenie z istniejącym kalendarzem
     new_calendar = pd.concat([calendar, new_calendar], ignore_index=True)
@@ -125,8 +220,77 @@ def check_team_id(team_name):
         wyniki.close()
     return tbr
 
+def process_one_card(soup_part):
 
-def extract_data():
+    print(soup_part)
+    for tag in soup_part.find_all('a'):
+        print(tag.attrs)
+    # print(soup_part.prettify()[:1000])
+    tags = {tag.name for tag in soup_part.find_all(True)}
+    print(tags)
+    """
+    features = []
+    for a in soup_part.find_all('a', class_=lambda c: c and 'offer-fixture-card' in c):
+        # data / czas
+        time_tag = a.find('time')
+        print(time_tag)
+        date = time_tag.get_text(strip=True) if time_tag else None
+
+        print(date)
+
+        # drużyny
+        participants = [p.get_text(" ", strip=True) for p in a.select('.fixture-card__participant')]
+        home = participants[0] if len(participants) > 0 else None
+        away = participants[1] if len(participants) > 1 else None
+
+        # znajdź sekcję "Wynik meczu"
+        market_section = None
+        for sec in a.select('section.fixture-card__market'):
+            heading = sec.find(lambda tag: tag.name == 'div' and 'Wynik meczu' in tag.get_text(" ", strip=True))
+            if heading:
+                market_section = sec
+                break
+
+        odds_1 = odds_x = odds_2 = None
+        if market_section:
+            outcomes = market_section.select('.odds-button2')
+            pairs = []
+            for o in outcomes:
+                lbl_tag = o.select_one('.odds-button2__label')
+                val_tag = o.select_one('.odds-button2__value')
+                if lbl_tag and val_tag:
+                    pairs.append((lbl_tag.get_text(strip=True), val_tag.get_text(strip=True)))
+
+            # próbuj mapować etykiety (np. "Wisła K.", "Remis", "S.Rzeszów"), inaczej fallback po kolejności
+            for idx, (lbl, val) in enumerate(pairs):
+                if home and lbl.strip().lower() == home.strip().lower():
+                    odds_1 = val
+                elif 'remis' in lbl.strip().lower() or lbl.strip().lower() == 'x':
+                    odds_x = val
+                elif away and lbl.strip().lower() == away.strip().lower():
+                    odds_2 = val
+                else:
+                    # fallback po kolejności: 0->1, 1->X, 2->2
+                    if idx == 0 and odds_1 is None:
+                        odds_1 = val
+                    elif idx == 1 and odds_x is None:
+                        odds_x = val
+                    elif idx == 2 and odds_2 is None:
+                        odds_2 = val
+
+        features.append({
+            "home": home,
+            "away": away,
+            "date": date,
+            "odds_1": odds_1,
+            "odds_X": odds_x,
+            "odds_2": odds_2,
+        })
+        print(features)
+"""
+
+
+def extract_data_a():
     driver = webdriver.Chrome()
     driver.maximize_window()
 
@@ -143,41 +307,149 @@ def extract_data():
     time.sleep(1)
 
     try:
+        xpath = f"//div[contains(@class, 'side-menu-item__title') and contains(text(), '{league_name}')]"
         ekstraklasa = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((
-            By.XPATH, "//div[contains(@class, 'side-menu-item__title') and contains(text(), 'Ekstraklasa Polska')]"
+            By.XPATH, xpath
+            # By.XPATH, "//div[contains(@class, 'side-menu-item__title') and contains(text(), 'Ekstraklasa Polska')]"
             # By.XPATH, "//div[contains(@class, 'side-menu-item__title') and contains(text(), 'Polska 1.')]"
         )))
         driver.execute_script("arguments[0].scrollIntoView();", ekstraklasa)
         ekstraklasa.click()
-        print("Kliknięto w Ekstraklasa Polska!")
+
+        print(f"Kliknięto w {league_name}")
         time.sleep(TIME_SLEEP)
 
-        kursy_div = WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "span.odds-button__value-current"))
-        )
+        #kursy_div = WebDriverWait(driver, 20).until(
+        #    # EC.presence_of_element_located((By.CSS_SELECTOR, "span.odds-button__value-current"))
+        #    EC.presence_of_element_located((By.CSS_SELECTOR, "grow offer-tournament-overview-container flex flex-col gap-8"))
+        #)
 
-        """
-        kursy_div = WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located(
-                (By.CSS_SELECTOR,
-                 "#main-container__content > div > main > div:nth-child(1) > div.grow.offer-tournament-overview-container.flex.flex-col.gap-8")
-            )
-        )
-        print("Załadowano div z kursami!")
-         html = driver.page_source
+        html = driver.page_source
+        driver.close()
+
+
+    except Exception as e:
+        print("Nie udało się kliknąć:", e)
+        return None
+
+    try:
         with open("efortuna_ekstraklasa.html", "w", encoding="utf-8") as f:
             f.write(html)
-        """
+            print('Download successful')
+
+    except Exception as e:
+        print('Saving failed')
+
+        return  None
+
+def extract_data_b():
+    with open("efortuna_ekstraklasa.html", "r", encoding="utf-8") as f:
+        html = f.read()
+
+    # tworzymy obiekt BeautifulSoup
+    soup = BeautifulSoup(html, "html.parser")
+    # Szukamy wszystkich kart meczowych
+    fixtures_cards = soup.find_all("a", class_=lambda c: c and "offer-fixture-card" in c)
+
+    matches = []
+    for a_tag in fixtures_cards:
+        #print(a_tag, end="\n")
+
+        match_data = {}
+
+        event_id_raw = a_tag.get("data-id")  # np. ufo:mtch:1kp-029
+        event_id = None
+        if event_id_raw:
+            match = re.search(r"ufo:mtch:([a-z0-9\-]+)", event_id_raw)
+            if match:
+                bigint_candidate = re.sub(r"[^0-9]", "", match.group(1))
+                event_id = event_id_to_bigint(event_id_raw)
+
+        match_data["event-id"] = event_id
+
+        ##  nazwa meczu (aria-label)
+        #match_data["mecz"] = a_tag.get("aria-label", "")
+        #print(match_data["mecz"])
+
+        # nazwy drużyn (pierwsze dwa <div> z klasą fixture-card__participant)
+        participants = a_tag.find_all("div", class_="fixture-card__participant")
+        if len(participants) >= 2:
+            #match_data["home"] = participants[0].get_text(strip=True)
+            #match_data["away"] = participants[1].get_text(strip=True)
+            match_data["market-name"] = participants[0].get_text(strip=True) + " - " + participants[1].get_text(strip=True)
+        #print(match_data)
+
+        # data meczu (w <time>)
+        time_tag = a_tag.find("time")
+        if time_tag:
+            date_raw = time_tag.get_text(strip=True)
+            event_date_parsed = parse_event_date(date_raw)
+            match_data["event-datetime"] = event_date_parsed
+            #print(match_data)
+        # kursy — trzy pierwsze <div> z klasą odds-button2__value
+        odds_tags = a_tag.find_all("div", class_="odds-button2__value")
+        if len(odds_tags) >= 3:
+            match_data["1"] = odds_tags[0].get_text(strip=True)
+            match_data["X"] = odds_tags[1].get_text(strip=True)
+            match_data["2"] = odds_tags[2].get_text(strip=True)
+        else:
+            # brak kursów (np. mecz w przygotowaniu)
+            match_data["1"] = match_data["X"] = match_data["2"] = None
+        print(match_data)
+        matches.append(match_data)
+
+    matches_df = pd.DataFrame(matches)
+    matches_df.to_csv('fortuna-test-extracted-data.csv', index=False)
+
+    return matches_df
+
+
+    # for a_tag in soup.find_all("a", class_=lambda c: c and "offer-fixture-card" in c):
+    #    print(f"a_tag: {a_tag}")
+
+    # fixtures = soup.find_all("a", class_="no-underline fixture-safe-link cursor-pointer fixture-card w-full last:rounded-b-lg offer-fixture-card relative")
+    # print(f"fixtures: {len(fixtures)}")
+    # print(fixtures[1])
+
+
+def extract_data():
+    driver = webdriver.Chrome()
+    driver.maximize_window()
+
+    driver.get("https://www.efortuna.pl/")
+    time.sleep(5)
+
+    driver.execute_script("""
+    var overlay = document.getElementById('cookie-consent-overlay');
+    if(overlay) {
+      overlay.style.display = 'none';
+    }
+    """)
+
+    time.sleep(1)
+
+    try:
+        xpath = f"//div[contains(@class, 'side-menu-item__title') and contains(text(), '{league_name}')]"
+        ekstraklasa = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((
+            By.XPATH, xpath
+            # By.XPATH, "//div[contains(@class, 'side-menu-item__title') and contains(text(), 'Ekstraklasa Polska')]"
+            # By.XPATH, "//div[contains(@class, 'side-menu-item__title') and contains(text(), 'Polska 1.')]"
+        )))
+        driver.execute_script("arguments[0].scrollIntoView();", ekstraklasa)
+        ekstraklasa.click()
+
+        print(f"Kliknięto w {league_name}")
+        time.sleep(TIME_SLEEP)
+
+        #kursy_div = WebDriverWait(driver, 20).until(
+        #    # EC.presence_of_element_located((By.CSS_SELECTOR, "span.odds-button__value-current"))
+        #    EC.presence_of_element_located((By.CSS_SELECTOR, "grow offer-tournament-overview-container flex flex-col gap-8"))
+        #)
+
         html = driver.page_source
         with open("efortuna_ekstraklasa.html", "w", encoding="utf-8") as f:
             f.write(html)
-        # Pobierz HTML tego diva
-        # html = kursy_div.get_attribute('outerHTML')
 
-        # with open("test_page.html", "w", encoding="utf-8") as f:
-        #    f.write(html)
-
-        # 4. Parsuj przez BeautifulSoup
         soup = BeautifulSoup(driver.page_source, 'html.parser')
         driver.quit()
 
@@ -185,87 +457,47 @@ def extract_data():
         fixtures = soup.find_all("a", class_="fixture-safe-link")
         print(f"fixtures: {len(fixtures)}")
         matches = []
-        for fixture in fixtures:
 
+        ###
+        for fixture in fixtures:
             event_id_raw = fixture.get("data-id")  # np. ufo:mtch:1kp-029
             event_id = None
             if event_id_raw:
-                # Ekstra: wyciągnięcie samego identyfikatora (np. 1kp-029)
                 match = re.search(r"ufo:mtch:([a-z0-9\-]+)", event_id_raw)
                 if match:
-                    # Można przekonwertować na bigint, np. usuwając litery i myślniki:
                     bigint_candidate = re.sub(r"[^0-9]", "", match.group(1))
-                    # event_id = int(bigint_candidate)
                     event_id = event_id_to_bigint(event_id_raw)
 
             time_tag = fixture.select_one("time")
             event_date_raw = time_tag.text.strip() if time_tag else None
-
-            event_date_parsed = ""
-            if event_date_raw:
-                now = datetime.now()
-                try:
-                    if event_date_raw.startswith("dzisiaj"):
-                        hour_minute = re.search(r"(\d{1,2}):(\d{2})", event_date_raw)
-                        if hour_minute:
-                            h, m = map(int, hour_minute.groups())
-                            dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
-                            event_date_parsed = dt.strftime("%Y%m%d%H%M")
-                    elif event_date_raw.startswith("jutro"):
-                        hour_minute = re.search(r"(\d{1,2}):(\d{2})", event_date_raw)
-                        if hour_minute:
-                            h, m = map(int, hour_minute.groups())
-                            dt = now + timedelta(days=1)
-                            dt = dt.replace(hour=h, minute=m, second=0, microsecond=0)
-                            event_date_parsed = dt.strftime("%Y%m%d%H%M")
-                    else:
-                        # Usunięcie polskich skrótów dni tygodnia przed parsowaniem
-                        cleaned_date = re.sub(r"^\w{3,6}\.,\s*", "", event_date_raw)
-                        dt = datetime.strptime(cleaned_date, "%d.%m.%Y, %H:%M")
-                        event_date_parsed = dt.strftime("%Y%m%d%H%M")
-                except Exception as e:
-                    event_date_parsed = f"PARSE_ERROR"
-
+            event_date_parsed = parse_event_date(event_date_raw)
             event_date = event_date_parsed
+            print(f"parsed: {event_date_parsed}")
 
-            odds_test = fixture.find_all("span", class_=["odds-button__value-current", "f-font-bold", "f-text-xs"])
-            print(f"len(odds_test) = {len(odds_test)}")
-
+            # Pobieramy drużyny
             teams = fixture.select(".fixture-card__participant-name")
+            print(f"teams: {teams}")
             if len(teams) < 2:
                 continue
             team1 = teams[0].get_text(strip=True)
             team2 = teams[1].get_text(strip=True)
 
-            # Szukamy kursów dla zakładu "Wynik meczu
-
-            markets = fixture.select(".fixture-card__market")
-            if len(markets) < 1:
-                markets = fixture.select(".fixture-card__markets")
-            print(f"len markets = {len(markets)}")
-            if not markets:
-                markets = fixture.select(".fixture-card__markets")
-
-            print(markets)
+            # Pobieramy kursy dla rynku "Wynik meczu"
             match_result_odds = []
-            for market in markets:
-                market_name = market.select_one(".fixture-card__market-name")
-                if market_name and market_name.get_text(strip=True).lower() == "wynik meczu":
-                    outcomes = market.select(".fixture-card__market-odds")
-                    for outcome in outcomes:
-                        label = outcome.select_one(".odds-button__name").get_text(strip=True)
-                        odd = outcome.select_one(".odds-button__value-current").get_text(strip=True)
-                        match_result_odds.append((label, odd))
-                        print(label)
-                        print(odd)
-                    break
+            market = fixture.select_one(".fixture-card__market-outcomes")
+            if market:
+                outcomes = market.select(".fixture-card__market-odds")
+                for outcome in outcomes:
+                    label = outcome.select_one(".odds-button__name")
+                    odd = outcome.select_one(".odds-button__value-current")
+                    if label and odd:
+                        match_result_odds.append((label.get_text(strip=True), odd.get_text(strip=True)))
+                        print(label.get_text(strip=True), odd.get_text(strip=True))
 
+            # fallback → jeśli brak kursów, to pola będą None
             matches.append({
-                # "event-id_raw" : event_id_raw,
-                "market-name": team1 + "-" + team2,
+                "market-name": f"{team1} - {team2}",
                 "event-id": event_id,
-                # "Drużyna 1": team1,
-                # "Drużyna 2": team2,
                 "1": match_result_odds[0][1] if len(match_result_odds) > 0 else None,
                 "X": match_result_odds[1][1] if len(match_result_odds) > 1 else None,
                 "2": match_result_odds[2][1] if len(match_result_odds) > 2 else None,
@@ -276,13 +508,13 @@ def extract_data():
         matches_df = pd.DataFrame(matches)
         print(matches_df)
 
-        matches_df.to_csv('fortuna-test-extracted-data.csv', index=False)
 
         return matches_df
 
     except Exception as e:
         print("Nie udało się kliknąć:", e)
         return None
+
 
 
 def extract_data_1(path=path):
@@ -441,7 +673,10 @@ def update_table(df, table, mode):
 
 # SECTION ETL
 # EXTRACT
-extracted = extract_data()
+extract_data_a()
+# exctract_data_a()
+extracted = extract_data_b()
+print(extracted)
 
 print(f"extracted: {extracted}")
 
@@ -462,11 +697,13 @@ df_from_scrap.drop(['event-datetime', 'home', 'away', 'NAME_FORTUNA_x', 'NAME_FO
                    axis='columns', inplace=True)
 
 df_from_scrap.rename(columns={"ID_x": "ID_team_home", "ID_y": "ID_team_away", "ID": "ID_date"}, inplace=True)
-df_from_scrap.to_csv('fortuna-test-transformed-data.csv', index=False)
 
+df_from_scrap["ID_LEAGUE"] = LEAGUE_PARAMETER
+df_from_scrap.to_csv('fortuna-test-transformed-data.csv', index=False)
+print(df_from_scrap)
 print("End of section: TRANSFORM")
 # LOAD
-
 update_table(df=df_teams, table='teams', mode='replace')
 update_table(df=df_calendar, table='calendar', mode='replace')
 update_table(df=df_from_scrap, table='odds', mode='append')
+print("End of section: LOAD")
